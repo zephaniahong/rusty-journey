@@ -4,15 +4,17 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-struct SPSC<T> {
+use crossbeam_utils::CachePadded;
+
+pub struct SPSC<T> {
     data: Box<[UnsafeCell<MaybeUninit<T>>]>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
     capacity: usize,
 }
 
 impl<T> SPSC<T> {
-    fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         let data = std::iter::repeat_with(|| {
             let u: MaybeUninit<T> = MaybeUninit::uninit();
             UnsafeCell::new(u)
@@ -23,8 +25,8 @@ impl<T> SPSC<T> {
 
         Self {
             data,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
             capacity,
         }
     }
@@ -37,7 +39,7 @@ impl<T> SPSC<T> {
 unsafe impl<'a, T: Send> Send for Writer<'a, T> {}
 unsafe impl<'a, T: Send> Send for Reader<'a, T> {}
 
-struct Writer<'a, T> {
+pub struct Writer<'a, T> {
     channel: &'a SPSC<T>,
 }
 
@@ -46,8 +48,9 @@ impl<'a, T> Writer<'a, T> {
         Self { channel }
     }
     pub fn send(&mut self, data: T) -> Option<T> {
+        let tail = self.channel.tail.load(Ordering::Relaxed);
         let head = self.channel.head.load(Ordering::Acquire);
-        let tail = self.channel.tail.load(Ordering::Acquire);
+
         if (tail + 1) % self.channel.capacity == head {
             Some(data)
         } else {
@@ -64,7 +67,7 @@ impl<'a, T> Writer<'a, T> {
     }
 }
 
-struct Reader<'a, T> {
+pub struct Reader<'a, T> {
     channel: &'a SPSC<T>,
 }
 
@@ -74,7 +77,7 @@ impl<'a, T> Reader<'a, T> {
     }
 
     pub fn recv(&mut self) -> Option<T> {
-        let head = self.channel.head.load(Ordering::Acquire);
+        let head = self.channel.head.load(Ordering::Relaxed);
         let tail = self.channel.tail.load(Ordering::Acquire);
 
         if head == tail {
@@ -113,10 +116,8 @@ mod tests {
             s.spawn(move || {
                 for i in 0..N {
                     while writer.send(i).is_some() {
-                        println!("Unable to write: {i}");
                         std::thread::yield_now();
                     }
-                    println!("Wrote data: {i}");
                 }
             });
 
@@ -125,14 +126,11 @@ mod tests {
             while store.len() < N {
                 match reader.recv() {
                     Some(data) => {
-                        println!("Read data: {data}");
                         store.push(data);
                     }
                     None => std::thread::yield_now(),
                 }
             }
-
-            println!("{:?}", store);
         });
     }
 }
