@@ -14,7 +14,10 @@ pub struct SPSC<T> {
 }
 
 impl<T> SPSC<T> {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Result<Self, ()> {
+        if !capacity.is_power_of_two() {
+            return Err(());
+        }
         let data = std::iter::repeat_with(|| {
             let u: MaybeUninit<T> = MaybeUninit::uninit();
             UnsafeCell::new(u)
@@ -23,12 +26,12 @@ impl<T> SPSC<T> {
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
-        Self {
+        Ok(Self {
             data,
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             capacity,
-        }
+        })
     }
 
     pub fn split<'a>(&'a mut self) -> (Writer<'a, T>, Reader<'a, T>) {
@@ -50,18 +53,17 @@ impl<'a, T> Writer<'a, T> {
     pub fn send(&mut self, data: T) -> Option<T> {
         let tail = self.channel.tail.load(Ordering::Relaxed);
         let head = self.channel.head.load(Ordering::Acquire);
+        let idx = tail & (self.channel.capacity - 1);
 
-        if (tail + 1) % self.channel.capacity == head {
-            Some(data)
+        if tail - head == self.channel.capacity {
+            Some(data) // Full
         } else {
             unsafe {
-                (*self.channel.data)[tail]
+                (*self.channel.data)[idx]
                     .get()
                     .write(MaybeUninit::new(data))
             };
-            self.channel
-                .tail
-                .store((tail + 1) % self.channel.capacity, Ordering::Release);
+            self.channel.tail.store(tail + 1, Ordering::Release);
             None
         }
     }
@@ -79,20 +81,19 @@ impl<'a, T> Reader<'a, T> {
     pub fn recv(&mut self) -> Option<T> {
         let head = self.channel.head.load(Ordering::Relaxed);
         let tail = self.channel.tail.load(Ordering::Acquire);
+        let idx = head & (self.channel.capacity - 1);
 
-        if head == tail {
-            None
+        if tail - head == 0 {
+            None // Empty
         } else {
             let cell = (*self.channel.data)
-                .get(head)
+                .get(idx)
                 .expect("Index should always be within bounds")
                 .get();
 
             let data = unsafe { Some(cell.read().assume_init()) };
 
-            self.channel
-                .head
-                .store((head + 1) % self.channel.capacity, Ordering::Release);
+            self.channel.head.store(head + 1, Ordering::Release);
 
             data
         }
@@ -107,7 +108,8 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let mut spsc = SPSC::new(5);
+        let mut spsc = SPSC::new(8).unwrap();
+        let mut store = Vec::new();
 
         const N: usize = 100;
         thread::scope(|s| {
@@ -121,8 +123,6 @@ mod tests {
                 }
             });
 
-            let mut store = Vec::new();
-
             while store.len() < N {
                 match reader.recv() {
                     Some(data) => {
@@ -132,5 +132,13 @@ mod tests {
                 }
             }
         });
+
+        let mut res = Vec::new();
+
+        for i in 0..100 {
+            res.push(i);
+        }
+
+        assert_eq!(res, store);
     }
 }

@@ -11,7 +11,7 @@ criterion_main!(benches);
 
 fn test() {
     const N: usize = 10000;
-    let mut spsc = SPSC::new(100);
+    let mut spsc = SPSC::new(128).unwrap();
     let (mut writer, mut reader) = spsc.split();
 
     thread::scope(|s| {
