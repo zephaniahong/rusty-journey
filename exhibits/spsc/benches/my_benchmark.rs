@@ -10,8 +10,8 @@ criterion_group!(benches, criterion_benchmark);
 criterion_main!(benches);
 
 fn test() {
-    const N: usize = 10000;
-    let mut spsc = SPSC::new(128).unwrap();
+    const N: usize = 100000;
+    let mut spsc: SPSC<usize, 128> = SPSC::new().unwrap();
     let (mut writer, mut reader) = spsc.split();
 
     thread::scope(|s| {
