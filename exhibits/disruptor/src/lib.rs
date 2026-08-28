@@ -2,25 +2,56 @@
 
 use std::{
     cell::UnsafeCell,
-    cmp::min,
-    marker::PhantomData,
     mem::MaybeUninit,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread::{self, JoinHandle},
+    sync::atomic::{AtomicUsize, Ordering},
+    thread::JoinHandle,
 };
 
-struct Producer<T> {
-    data: PhantomData<T>,
+struct Producer<'a, T> {
+    rb: &'a RingBuffer<T>,
+    barriers: &'a Vec<Barrier<T>>,
+    seq: Sequence,
 }
 
-struct Executor<T> {
-    data: PhantomData<T>,
+impl<'a, T> Producer<'a, T> {
+    pub fn new(rb: &'a RingBuffer<T>, barriers: &'a Vec<Barrier<T>>) -> Self {
+        Self {
+            rb,
+            barriers,
+            seq: Sequence::new(),
+        }
+    }
+
+    pub fn send(&self, data: T) -> Option<T> {
+        let tail = self.seq.get(Ordering::Acquire);
+        let max_consumer = self
+            .barriers
+            .iter()
+            .map(|b| &b.seq)
+            .map(|s| s.get(Ordering::Relaxed))
+            .max()
+            .unwrap();
+
+        if tail - max_consumer == self.rb.size() {
+            // FULL
+            Some(data)
+        } else {
+            let idx = tail & (self.rb.size() - 1);
+            self.rb.set(idx, data);
+            None
+        }
+    }
 }
 
-impl<T> Executor<T> {
+struct Executor<'a, T> {
+    rb: &'a RingBuffer<T>,
+    barriers: &'a Vec<Barrier<T>>,
+}
+
+impl<'a, T> Executor<'a, T> {
+    pub fn new(rb: &'a RingBuffer<T>, barriers: &'a Vec<Barrier<T>>) -> Self {
+        Self { rb, barriers }
+    }
     pub fn spawn(&self) -> JoinHandle<T> {
         todo!()
     }
@@ -37,15 +68,18 @@ impl Sequence {
         }
     }
 
-    pub fn get(&self) -> usize {
-        self.seq.load(Ordering::Acquire)
+    pub fn get(&self, ordering: Ordering) -> usize {
+        self.seq.load(ordering)
+    }
+
+    pub fn set(&self, val: usize) {
+        self.seq.store(val, Ordering::Release);
     }
 }
 
 enum Handler<T> {
-    Read(Box<dyn FnMut() + Send>),
-    Write(Box<dyn FnMut() + Send>),
-    _Marker(PhantomData<T>),
+    Read(Box<dyn Fn(&T) + Send>),
+    Write(Box<dyn FnMut(&mut T) + Send>),
 }
 
 struct Barrier<T> {
@@ -63,7 +97,7 @@ impl<T> Barrier<T> {
 
     pub fn handle_event<F>(&mut self, handler: F) -> &mut Self
     where
-        F: FnMut() + Send + 'static,
+        F: Fn(&T) + Send + 'static,
     {
         self.handlers.push(Handler::Read(Box::new(handler)));
         self
@@ -71,7 +105,7 @@ impl<T> Barrier<T> {
 
     pub fn handle_event_mut<F>(&mut self, handler: F) -> &mut Self
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(&mut T) + Send + 'static,
     {
         self.handlers.push(Handler::Write(Box::new(handler)));
         self
@@ -87,6 +121,7 @@ impl<T> Barrier<T> {
 
 struct RingBuffer<T> {
     slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    capacity: usize,
 }
 
 impl<T> RingBuffer<T> {
@@ -95,11 +130,19 @@ impl<T> RingBuffer<T> {
             .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
             .collect();
 
-        Self { slots }
+        Self { slots, capacity }
     }
 
-    pub fn index(&self, idx: usize) -> T {
+    pub fn size(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn get(&self, idx: usize) -> T {
         todo!()
+    }
+
+    pub fn set(&self, idx: usize, data: T) {
+        unsafe { self.slots[idx].get().write(MaybeUninit::new(data)) };
     }
 }
 
@@ -107,7 +150,7 @@ unsafe impl<T: Send> Send for RingBuffer<T> {}
 unsafe impl<T: Send + Sync> Sync for RingBuffer<T> {}
 
 struct DisruptorBuilder<T> {
-    data: Arc<RingBuffer<T>>,
+    data: RingBuffer<T>,
     producer_seq: Sequence,
     barriers: Vec<Barrier<T>>,
 }
@@ -120,7 +163,7 @@ impl<T: Send + Sync + 'static> DisruptorBuilder<T> {
         );
 
         DisruptorBuilder {
-            data: Arc::new(RingBuffer::new(capacity)),
+            data: RingBuffer::new(capacity),
             producer_seq: Sequence::new(),
             barriers: Vec::new(),
         }
@@ -137,40 +180,11 @@ impl<T: Send + Sync + 'static> DisruptorBuilder<T> {
         self
     }
 
-    pub fn build<'a>(self) -> (Executor<T>, Producer<T>) {
-        // spawn a thread for each of the handlers
+    pub fn build<'a>(&'a mut self) -> (Executor<'a, T>, Producer<'a, T>) {
+        let executor = Executor::new(&self.data, &self.barriers);
+        let producer = Producer::new(&self.data, &self.barriers);
 
-        let barriers = self.barriers;
-        for window in self.barriers.windows(2) {
-            let prev = window[0];
-            let curr = window[1];
-            // For each barrier, find out whats the maximum index it can read
-            // Need to make sure previous barrier (i - 1) is done and producer is ahead
-            for handler in curr.handlers {
-                let idx = barriers[min(0, i - 1)].seq.get();
-                let data = self.data.clone();
-                // Find out whats the highest index this thread can read
-
-                match handler {
-                    Handler::Read(mut f) => {
-                        let t = thread::spawn(move || {
-                            loop {
-                                let x = data.index(5);
-                                f(); // TODO: take the data as an argument
-                            }
-                        });
-                    }
-                    Handler::Write(mut f) => {
-                        thread::spawn(move || {
-                            f();
-                        });
-                    }
-                    Handler::_Marker(phantom_data) => todo!(),
-                }
-            }
-        }
-
-        todo!()
+        (executor, producer)
     }
 }
 
@@ -180,19 +194,20 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let (executor, producer) = DisruptorBuilder::<u64>::new(128)
+        let mut builder = DisruptorBuilder::<u64>::new(128)
             .with_barrier(|b| {
-                b.handle_event(|| {
+                b.handle_event(|d| {
                     println!("Logging ");
                 });
-                b.handle_event(|| {
+                b.handle_event(|d| {
                     println!("Sending to backup");
                 });
             })
             .with_barrier(|b| {
-                b.handle_event_mut(|| println!("mutable event"));
-            })
-            .build();
+                b.handle_event_mut(|d| println!("mutable event"));
+            });
+
+        let (executor, producer) = builder.build();
 
         let handle = executor.spawn();
 
